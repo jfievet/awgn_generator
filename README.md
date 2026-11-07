@@ -34,7 +34,9 @@ within that command.
 
 Backpressure freezes the pipeline and serializer together. Reset is active low
 and synchronous; it clears all registers and restores the configured PRNG seed.
-There are no signal declaration initializers or variable declarations in `src/`.
+The generator sources have no signal declaration initializers or process-local
+variables. The histogram extension uses process-local variables for decoding and
+arithmetic, with explicit synchronous reset for all persistent control state.
 The design uses portable numeric_std arithmetic and inferrable multipliers;
 frequency, DSP mapping, and resource usage require synthesis on the target FPGA.
 
@@ -49,3 +51,16 @@ compares the first 100 integers in `model/samples_raw.txt`; other configurations
 use the behavioral reference because that file represents the default settings.
 These tests are provided for execution by the user; no compilation, simulation,
 or synthesis was performed while adding the RTL.
+
+
+## AXI4-Lite histogram analyzer
+
+`src/bm_histogram_axi.vhd` integrates the real generator with a synchronous BRAM
+histogram, 64-bit statistical counters and a 32-bit AXI4-Lite slave. See
+[the register and integration guide](docs/bm_histogram_axi.md) for the complete
+register map, coherent reads, START/CONTINUE/CLEAR semantics and limitations.
+
+The new synthesizable modules use VHDL-1993-compatible constructs. The dedicated
+`sim/run_bm_histogram_axi_tb.py` registers RTL in VHDL-1993 mode and testbenches
+in VHDL-2008 mode. The testbenches and scripts are provided without execution;
+no compilation, simulation or synthesis was performed for this addition.
