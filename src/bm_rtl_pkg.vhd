@@ -25,6 +25,28 @@ package bm_rtl_pkg is
     end record;
 
 
+    -- Internal pipeline payload shared by the AWGN functional blocks.
+    -- Each block preserves metadata and updates only its computed fields.
+    type bm_token_t is record
+        valid, single, two : std_logic;
+        sample : bm_s64;
+        x, y, z : bm_s64;
+        exponent_value : unsigned(6 downto 0);
+        phase, radicand, root, remainder_value, radius : bm_u64;
+        cosine, sine, product0, product1, z0, z1 : bm_s64;
+        quadrant : unsigned(1 downto 0);
+    end record;
+    constant BM_EMPTY_TOKEN : bm_token_t := (
+        valid => '0', single => '0', two => '0', sample => (others => '0'),
+        x => (others => '0'), y => (others => '0'), z => (others => '0'),
+        exponent_value => (others => '0'), phase => (others => '0'),
+        radicand => (others => '0'), root => (others => '0'),
+        remainder_value => (others => '0'), radius => (others => '0'),
+        cosine => (others => '0'), sine => (others => '0'),
+        product0 => (others => '0'), product1 => (others => '0'),
+        z0 => (others => '0'), z1 => (others => '0'), quadrant => (others => '0'));
+    type bm_pipeline_t is array(natural range <>) of bm_token_t;
+
     function max_nat(a,b : natural) return natural;
     function bm_sqrt_rad_shift(c : bm_config_t) return integer;
     function bm_sqrt_rad_bits(c : bm_config_t) return integer;

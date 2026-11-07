@@ -4,7 +4,6 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 use work.bm_rtl_pkg.all;
-use work.bm_rtl_constants_pkg.all;
 
 entity bm_axis_rtl is
     generic (
@@ -103,32 +102,13 @@ architecture rtl of bm_axis_rtl is
     constant SQ_END : natural := SQ_IN+NS;
     constant T_IN : natural := SQ_END+1;
     constant T_END : natural := max_nat(T_IN,BM_TRIG_ITERATIONS+1)+1;
-    constant LAST : natural := T_END+3;
-    type token_t is record
-        valid, single, two : std_logic;
-        sample : bm_s64;
-        x, y, z : bm_s64;
-        exponent_value : unsigned(6 downto 0);
-        phase, radicand, root, remainder_value, radius : bm_u64;
-        cosine, sine, product0, product1, z0, z1 : bm_s64;
-        quadrant : unsigned(1 downto 0);
-    end record;
-    constant EMPTY_TOKEN : token_t := (
-        valid => '0', single => '0', two => '0', sample => (others => '0'),
-        x => (others => '0'), y => (others => '0'), z => (others => '0'),
-        exponent_value => (others => '0'), phase => (others => '0'),
-        radicand => (others => '0'), root => (others => '0'),
-        remainder_value => (others => '0'), radius => (others => '0'),
-        cosine => (others => '0'), sine => (others => '0'),
-        product0 => (others => '0'), product1 => (others => '0'),
-        z0 => (others => '0'), z1 => (others => '0'), quadrant => (others => '0'));
-    type pipeline_t is array(natural range <>) of token_t;
-    signal pipe : pipeline_t(0 to LAST);
-    signal trig_pipe : pipeline_t(0 to T_END-1);
+    signal input_token, normalized_token, log_token, result_token : bm_token_t;
+    signal pipe : bm_pipeline_t(T_IN to T_END);
+    signal trig_pipe : bm_pipeline_t(BM_TRIG_ITERATIONS+1 to T_END-1);
     signal advance, issue, input_ready, output_valid : std_logic;
     signal busy, cooldown, cached_valid, second_valid : std_logic;
     signal to_generate, to_transfer : unsigned(31 downto 0);
-    signal prng_state, next_state, pair_state, raw_u1, raw_u2, mantissa : bm_u64;
+    signal prng_state, next_state, pair_state, raw_u1, raw_u2 : bm_u64;
     signal cached_sample, second_sample, output_sample : bm_s64;
 begin
     assert CONFIG_VALID report "Invalid RTL Box-Muller configuration" severity failure;
@@ -142,166 +122,41 @@ begin
     pair_state <= prng_step(next_state,BM_PRNG_BITS);
     raw_u1 <= nonzero(shift_right(next_state,BM_PRNG_BITS-BM_U1_BITS));
     raw_u2 <= shift_right(pair_state,BM_PRNG_BITS-BM_U2_BITS);
-    mantissa <= fm_uscale(raw_u1,top_bit(raw_u1),BM_LOG_X_FRAC_BITS,BM_LOG_X_BITS-1,0,0);
-
-    -- First stage normalizes U1 and retains U2 for the trig branch.
-    input_stage : process(aclk)
+    -- Combinational launch metadata; bm_log owns the original input register.
+    launch_token : process(issue, cached_valid, cached_sample, to_generate, raw_u1, raw_u2)
     begin
-        if rising_edge(aclk) then
-            if aresetn = '0' then
-                pipe(0) <= EMPTY_TOKEN;
-            elsif advance = '1' then
-                pipe(0) <= EMPTY_TOKEN;
-                pipe(0).valid <= issue;
-                pipe(0).single <= cached_valid;
-                pipe(0).sample <= cached_sample;
-                if to_generate >= 2 then pipe(0).two <= '1'; end if;
-                pipe(0).x <= signed(mantissa)+signed(shift_left(U_ONE,BM_LOG_X_FRAC_BITS));
-                pipe(0).y <= signed(mantissa)-signed(shift_left(U_ONE,BM_LOG_X_FRAC_BITS));
-                pipe(0).exponent_value <= to_unsigned(BM_U1_BITS-top_bit(raw_u1),7);
-                pipe(0).phase <= raw_u2;
-            end if;
-        end if;
+        input_token <= BM_EMPTY_TOKEN;
+        input_token.valid <= issue;
+        input_token.single <= cached_valid;
+        input_token.sample <= cached_sample;
+        if to_generate >= 2 then input_token.two <= '1'; end if;
+        input_token.x <= signed(raw_u1);
+        input_token.phase <= raw_u2;
     end process;
 
-    log_stages : for i in 0 to BM_LOG_ITERATIONS-1 generate
-        constant SHIFT : positive := log_shift(i);
-        constant ANGLE : bm_s64 := signed(fm_constant(BM_ATANH_Q60(SHIFT),BM_LOG_CONST_FRAC_BITS,BM_LOG_Z_FRAC_BITS));
-    begin
-        process(aclk)
-        begin
-            if rising_edge(aclk) then
-                if aresetn = '0' then pipe(i+1) <= EMPTY_TOKEN;
-                elsif advance = '1' then
-                    pipe(i+1) <= pipe(i);
-                    if pipe(i).y >= 0 then
-                        pipe(i+1).x <= fm_wrap(pipe(i).x-shift_right(pipe(i).y,SHIFT),BM_LOG_X_BITS);
-                        pipe(i+1).y <= fm_wrap(pipe(i).y-shift_right(pipe(i).x,SHIFT),BM_LOG_Y_BITS);
-                        pipe(i+1).z <= fm_wrap(pipe(i).z+ANGLE,BM_LOG_Z_BITS);
-                    else
-                        pipe(i+1).x <= fm_wrap(pipe(i).x+shift_right(pipe(i).y,SHIFT),BM_LOG_X_BITS);
-                        pipe(i+1).y <= fm_wrap(pipe(i).y+shift_right(pipe(i).x,SHIFT),BM_LOG_Y_BITS);
-                        pipe(i+1).z <= fm_wrap(pipe(i).z-ANGLE,BM_LOG_Z_BITS);
-                    end if;
-                end if;
-            end if;
-        end process;
-    end generate;
+    log_block : entity work.bm_log
+        generic map (CONFIG => CONFIG)
+        port map (aclk => aclk, aresetn => aresetn, advance => advance,
+                  input_token => input_token, normalized_token => normalized_token,
+                  output_token => log_token);
 
-    log_finish : process(aclk)
-    begin
-        if rising_edge(aclk) then
-            if aresetn = '0' then
-                pipe(L_END+1) <= EMPTY_TOKEN;
-                pipe(L_END+2) <= EMPTY_TOKEN;
-                pipe(SQ_IN) <= EMPTY_TOKEN;
-            elsif advance = '1' then
-                pipe(L_END+1) <= pipe(L_END);
-                pipe(L_END+1).z <= mul_s64(to_signed(2*to_integer(pipe(L_END).exponent_value),64),
-                    signed(fm_constant(BM_LN2_Q60,BM_LOG_CONST_FRAC_BITS,BM_LOG_Z_FRAC_BITS)))
-                    -shift_left(pipe(L_END).z,2);
-                pipe(L_END+2) <= pipe(L_END+1);
-                if pipe(L_END+1).z <= 0 then
-                    pipe(L_END+2).radicand <= U_ZERO;
-                else
-                    pipe(L_END+2).radicand <= fm_uscale(unsigned(pipe(L_END+1).z),
-                        BM_LOG_Z_FRAC_BITS,BM_LOG_OUTPUT_FRAC_BITS,BM_LOG_OUTPUT_BITS,BM_ROUNDING_MODE,BM_OVERFLOW_MODE);
-                end if;
-                pipe(SQ_IN) <= pipe(L_END+2);
-                pipe(SQ_IN).radicand <= shift_left(fm_uscale(pipe(L_END+2).radicand,
-                    BM_LOG_OUTPUT_FRAC_BITS,BM_SQRT_INPUT_FRAC_BITS,BM_SQRT_INPUT_BITS,
-                    BM_ROUNDING_MODE,BM_OVERFLOW_MODE),bm_sqrt_rad_shift(CONFIG));
-            end if;
-        end if;
-    end process;
+    sqrt_block : entity work.bm_sqrt
+        generic map (CONFIG => CONFIG)
+        port map (aclk => aclk, aresetn => aresetn, advance => advance,
+                  input_token => log_token, output_token => pipe(T_IN));
 
-    sqrt_stages : for i in 0 to NS-1 generate
-        constant K : natural := SQ_IN+i;
-        signal shifted_remainder, trial : bm_u64;
-    begin
-        shifted_remainder <= (shift_left(pipe(K).remainder_value,2) or
-            (shift_right(pipe(K).radicand,2*(NS-1-i)) and to_unsigned(3,64))) and fm_mask(BM_SQRT_REMAINDER_BITS);
-        trial <= shift_left(pipe(K).root,2) or U_ONE;
-        process(aclk)
-        begin
-            if rising_edge(aclk) then
-                if aresetn = '0' then pipe(K+1) <= EMPTY_TOKEN;
-                elsif advance = '1' then
-                    pipe(K+1) <= pipe(K);
-                    if shifted_remainder >= trial then
-                        pipe(K+1).remainder_value <= shifted_remainder-trial;
-                        pipe(K+1).root <= shift_left(pipe(K).root,1) or U_ONE;
-                    else
-                        pipe(K+1).remainder_value <= shifted_remainder;
-                        pipe(K+1).root <= shift_left(pipe(K).root,1);
-                    end if;
-                end if;
-            end if;
-        end process;
-    end generate;
-
-    trig_input : process(aclk)
-    begin
-        if rising_edge(aclk) then
-            if aresetn = '0' then pipe(T_IN) <= EMPTY_TOKEN;
-            elsif advance = '1' then
-                pipe(T_IN) <= pipe(SQ_END);
-                if BM_ROUNDING_MODE /= 0 and pipe(SQ_END).remainder_value > pipe(SQ_END).root then
-                    pipe(T_IN).radius <= fm_unsigned(pipe(SQ_END).root+1,BM_SQRT_OUTPUT_BITS,BM_OVERFLOW_MODE);
-                else
-                    pipe(T_IN).radius <= fm_unsigned(pipe(SQ_END).root,BM_SQRT_OUTPUT_BITS,BM_OVERFLOW_MODE);
-                end if;
-            end if;
-        end if;
-    end process;
-
-    -- Parallel phase branch; its outputs are delayed to meet the radius.
-    trig_pipe(0) <= pipe(0);
-    trig_initialize : process(aclk)
-    begin
-        if rising_edge(aclk) then
-            if aresetn = '0' then trig_pipe(1) <= EMPTY_TOKEN;
-            elsif advance = '1' then
-                trig_pipe(1) <= trig_pipe(0);
-                trig_pipe(1).x <= signed(fm_constant(BM_INVERSE_GAIN_Q60(BM_TRIG_ITERATIONS),BM_TRIG_CONST_FRAC_BITS,BM_TRIG_X_FRAC_BITS));
-                trig_pipe(1).y <= (others => '0');
-                trig_pipe(1).z <= signed(fm_uscale(trig_pipe(0).phase and fm_mask(BM_U2_BITS-2),
-                    BM_U2_BITS,BM_TRIG_Z_FRAC_BITS,BM_TRIG_Z_BITS-1,0,0));
-                trig_pipe(1).quadrant <= resize(shift_right(trig_pipe(0).phase,BM_U2_BITS-2),2);
-            end if;
-        end if;
-    end process;
-
-    trig_stages : for i in 0 to BM_TRIG_ITERATIONS-1 generate
-        constant K : natural := 1+i;
-        constant ANGLE : bm_s64 := signed(fm_constant(BM_ATAN_TURN_Q60(i),BM_TRIG_CONST_FRAC_BITS,BM_TRIG_Z_FRAC_BITS));
-    begin
-        process(aclk)
-        begin
-            if rising_edge(aclk) then
-                if aresetn = '0' then trig_pipe(K+1) <= EMPTY_TOKEN;
-                elsif advance = '1' then
-                    trig_pipe(K+1) <= trig_pipe(K);
-                    if trig_pipe(K).z >= 0 then
-                        trig_pipe(K+1).x <= fm_wrap(trig_pipe(K).x-shift_right(trig_pipe(K).y,i),BM_TRIG_X_BITS);
-                        trig_pipe(K+1).y <= fm_wrap(trig_pipe(K).y+shift_right(trig_pipe(K).x,i),BM_TRIG_Y_BITS);
-                        trig_pipe(K+1).z <= fm_wrap(trig_pipe(K).z-ANGLE,BM_TRIG_Z_BITS);
-                    else
-                        trig_pipe(K+1).x <= fm_wrap(trig_pipe(K).x+shift_right(trig_pipe(K).y,i),BM_TRIG_X_BITS);
-                        trig_pipe(K+1).y <= fm_wrap(trig_pipe(K).y-shift_right(trig_pipe(K).x,i),BM_TRIG_Y_BITS);
-                        trig_pipe(K+1).z <= fm_wrap(trig_pipe(K).z+ANGLE,BM_TRIG_Z_BITS);
-                    end if;
-                end if;
-            end if;
-        end process;
-    end generate;
+    trig_block : entity work.bm_trig
+        generic map (CONFIG => CONFIG)
+        port map (aclk => aclk, aresetn => aresetn, advance => advance,
+                  input_token => normalized_token,
+                  output_token => trig_pipe(BM_TRIG_ITERATIONS+1));
 
     trig_alignment : for i in BM_TRIG_ITERATIONS+1 to T_END-2 generate
     begin
         process(aclk)
         begin
             if rising_edge(aclk) then
-                if aresetn = '0' then trig_pipe(i+1) <= EMPTY_TOKEN;
+                if aresetn = '0' then trig_pipe(i+1) <= BM_EMPTY_TOKEN;
                 elsif advance = '1' then trig_pipe(i+1) <= trig_pipe(i);
                 end if;
             end if;
@@ -313,7 +168,7 @@ begin
         process(aclk)
         begin
             if rising_edge(aclk) then
-                if aresetn = '0' then pipe(i+1) <= EMPTY_TOKEN;
+                if aresetn = '0' then pipe(i+1) <= BM_EMPTY_TOKEN;
                 elsif advance = '1' then
                     pipe(i+1) <= pipe(i);
                     if i = T_END-1 then
@@ -327,32 +182,10 @@ begin
         end process;
     end generate;
 
-    products : process(aclk)
-    begin
-        if rising_edge(aclk) then
-            if aresetn = '0' then
-                pipe(T_END+1) <= EMPTY_TOKEN;
-                pipe(T_END+2) <= EMPTY_TOKEN;
-                pipe(LAST) <= EMPTY_TOKEN;
-            elsif advance = '1' then
-                pipe(T_END+1) <= pipe(T_END);
-                case to_integer(pipe(T_END).quadrant) is
-                    when 0 => pipe(T_END+1).cosine <= pipe(T_END).x; pipe(T_END+1).sine <= pipe(T_END).y;
-                    when 1 => pipe(T_END+1).cosine <= -pipe(T_END).y; pipe(T_END+1).sine <= pipe(T_END).x;
-                    when 2 => pipe(T_END+1).cosine <= -pipe(T_END).x; pipe(T_END+1).sine <= -pipe(T_END).y;
-                    when others => pipe(T_END+1).cosine <= pipe(T_END).y; pipe(T_END+1).sine <= -pipe(T_END).x;
-                end case;
-                pipe(T_END+2) <= pipe(T_END+1);
-                pipe(T_END+2).product0 <= mul_s64(signed(pipe(T_END+1).radius),pipe(T_END+1).cosine);
-                pipe(T_END+2).product1 <= mul_s64(signed(pipe(T_END+1).radius),pipe(T_END+1).sine);
-                pipe(LAST) <= pipe(T_END+2);
-                pipe(LAST).z0 <= fm_scale(pipe(T_END+2).product0,BM_SQRT_OUTPUT_FRAC_BITS+BM_TRIG_X_FRAC_BITS,
-                    BM_OUTPUT_FRAC_BITS,BM_OUTPUT_BITS,BM_ROUNDING_MODE,BM_OVERFLOW_MODE);
-                pipe(LAST).z1 <= fm_scale(pipe(T_END+2).product1,BM_SQRT_OUTPUT_FRAC_BITS+BM_TRIG_Y_FRAC_BITS,
-                    BM_OUTPUT_FRAC_BITS,BM_OUTPUT_BITS,BM_ROUNDING_MODE,BM_OVERFLOW_MODE);
-            end if;
-        end if;
-    end process;
+    products_block : entity work.bm_products
+        generic map (CONFIG => CONFIG)
+        port map (aclk => aclk, aresetn => aresetn, advance => advance,
+                  input_token => pipe(T_END), output_token => result_token);
 
     stream_control : process(aclk)
     begin
@@ -384,15 +217,15 @@ begin
                 output_valid <= '0';
                 if second_valid = '1' then
                     output_sample <= second_sample; output_valid <= '1'; second_valid <= '0';
-                elsif pipe(LAST).valid = '1' then
+                elsif result_token.valid = '1' then
                     output_valid <= '1';
-                    if pipe(LAST).single = '1' then output_sample <= pipe(LAST).sample;
+                    if result_token.single = '1' then output_sample <= result_token.sample;
                     else
-                        output_sample <= pipe(LAST).z0;
-                        if pipe(LAST).two = '1' then
-                            second_sample <= pipe(LAST).z1; second_valid <= '1';
+                        output_sample <= result_token.z0;
+                        if result_token.two = '1' then
+                            second_sample <= result_token.z1; second_valid <= '1';
                         else
-                            cached_sample <= pipe(LAST).z1; cached_valid <= '1';
+                            cached_sample <= result_token.z1; cached_valid <= '1';
                         end if;
                     end if;
                 end if;

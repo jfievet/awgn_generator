@@ -5,8 +5,17 @@ FPGA based AWGN generator using Box Muller
 
 `src/bm_axis_rtl.vhd` exposes the same generics and AXI Stream ports as
 `bm_axis_behavioral`. Compile `src/bm_rtl_constants_pkg.vhd` and
-`src/bm_rtl_pkg.vhd` before the entity. The RTL does not use the behavioral
-packages.
+`src/bm_rtl_pkg.vhd` first, then the functional blocks `src/bm_log.vhd`,
+`src/bm_sqrt.vhd`, `src/bm_trig.vhd`, and `src/bm_products.vhd`, followed by
+`src/bm_axis_rtl.vhd` and its wrapper. The RTL does not use the behavioral
+packages. The blocks share `bm_config_t` and `bm_token_t` from `bm_rtl_pkg`.
+
+`bm_log` owns U1 normalization and the logarithmic pipeline; `bm_sqrt` adapts
+its input, extracts the root, and rounds the radius. `bm_trig` computes the
+parallel phase branch. `bm_products` applies the quadrant, multiplies, and
+converts the output format. `bm_axis_rtl` retains the PRNG, stream control,
+serializer, cached sample, and branch alignment. Each block uses the same
+clock, synchronous active-low reset, and global `advance` enable.
 
 An input beat is an unsigned 32-bit sample count. A zero count does nothing.
 Only one command is active at a time. The output contains signed fixed-point
